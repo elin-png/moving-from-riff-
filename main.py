@@ -1,151 +1,312 @@
 import os
-import pathlib
-import json
-import dotenv
-from fastapi import FastAPI, APIRouter, Depends
+import re
+import signal
+import time
+from contextlib import asynccontextmanager
+from typing import Any, Dict
 
-# Load environment files
-# First load shared .env file
-dotenv.load_dotenv(".env")
+from fastapi import Depends, FastAPI, HTTPException, params
+from fastapi.routing import APIRoute, APIWebSocketRoute
+from pydantic import BaseModel
 
-# Then load environment-specific file (defaults to dev)
-# Environment-specific values will override shared values
-environment = os.getenv("ENV", "dev")
-env_file = f".env.{environment}"
-dotenv.load_dotenv(env_file, override=True)
+from .apirouters import make_user_endpoints_router
+from .config import Config, checked_config
+from .exceptionmodel import ExceptionModel
+from .logcapture import install_logcapture
+from .messages import (
+    BackendReady,
+    BackendShutdown,
+    RefreshOpenapiSpecParams,
+    Topics,
+)
+from .mw.auth_mw import get_authorized_user
+from .mw.cookie_mw import CookieKillerMiddleware
+from .mw.requestid_mw import RequestIdMiddleware
+from .mw.workspace_mw import WorkspacePublishMiddleware
+from .notifications import DevxClient
+from .pathutils import convert_exception_to_model
+from .secrets import fetch_and_inject_secrets
+from .state import AppStateDep, get_app_state, init_app_state, set_app_state
+from .utils import compute_spec_signature, utc_now
 
-print(f"Loaded environment: {environment}")
-
-from databutton_app.mw.auth_mw import AuthConfig, get_authorized_user
-
-
-def get_router_config() -> dict:
-    try:
-        # Note: This file is not available to the agent
-        cfg = json.loads(open("routers.json").read())
-    except:
-        return False
-    return cfg
+# Get secrets from .env file or api, this must happen before loading the routers
+fetch_and_inject_secrets()
 
 
-def is_auth_disabled(router_config: dict, name: str) -> bool:
-    return router_config["routers"][name]["disableAuth"]
+def configure_log_forwarding(devx: DevxClient):
+    """Configure log forwarding.
+
+    Forwards logs to devx which sends them over websockets to web clients.
+
+    Skip when running locally because then there may
+    be circular dependencies in log captures so be careful.
+    When running locally for development there may be no devx server.
+    """
+
+    def forward_stdout(s: str):
+        devx.notify_logs(s, "info")
+
+    def forward_stderr(s: str):
+        devx.notify_logs(s, "error")
+
+    install_logcapture(forward_stdout, forward_stderr)
 
 
-def import_api_routers() -> APIRouter:
-    """Create top level router including all user defined endpoints."""
-    routes = APIRouter(prefix="/api")
+class HealthResponse(BaseModel):
+    status: str
 
-    router_config = get_router_config()
 
-    src_path = pathlib.Path(__file__).parent
+# def signal_handler(sig: int, frame: Optional[FrameType]):
+#     if sig in (signal.SIGTERM, signal.SIGINT, signal.SIGKILL):
+#         print(f"Received signal {sig}, shutting down databutton app")
+#         raise SystemExit(0)
+#
+#
+# signal.signal(signal.SIGTERM, signal_handler)
+# signal.signal(signal.SIGINT, signal_handler)
 
-    # Import API routers from "src/app/apis/*/__init__.py"
-    apis_path = src_path / "app" / "apis"
 
-    api_names = [
-        p.relative_to(apis_path).parent.as_posix()
-        for p in apis_path.glob("*/__init__.py")
-    ]
+health_shutdown_counter = (
+    5 if os.environ.get("SHUTDOWN_AFTER_HEALTHCHECK") == "1" else None
+)
 
-    api_module_prefix = "app.apis."
 
-    for name in api_names:
-        print(f"Importing API: {name}")
+def _health_shutdown_countdown():
+    """Special behaviour for Databutton service pool."""
+    global health_shutdown_counter
+    if health_shutdown_counter is None:
+        return
+    health_shutdown_counter -= 1
+    if health_shutdown_counter < 0:
+        print("Health checks completed, shutting down.")
+        time.sleep(1)
+        signal.raise_signal(signal.SIGTERM)
+    else:
+        print(f"{health_shutdown_counter} health checks left until shutdown")
+
+
+# NB: Name of this function becomes a property of the generated api client and callable by the user web app
+def check_health(
+    app_state: AppStateDep,
+) -> HealthResponse:
+    """Check health of application. Returns 200 when OK, 500 when not."""
+    if not app_state.started_event.is_set():
+        raise HTTPException(status_code=500)
+    _health_shutdown_countdown()
+    return HealthResponse(status="healthy")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifecycle context manager for the app in devx mode."""
+
+    app_state = get_app_state(app)
+    cfg = app_state.cfg
+    devx = app_state.devx
+
+    # Hack to avoid TestClient running lifespan multiple times
+    skip_init = app_state.started_event.is_set()
+
+    enable_publishing = bool(cfg.ENABLE_WORKSPACE_PUBLISH and not skip_init)
+
+    # Generate and post openapi spec to devx
+    spec: Dict[str, Any] | None = None
+    signature: str | None = None
+    if enable_publishing:
         try:
-            api_module = __import__(api_module_prefix + name, fromlist=[name])
-            api_router = getattr(api_module, "router", None)
-            if isinstance(api_router, APIRouter):
-                routes.include_router(
-                    api_router,
-                    dependencies=(
-                        []
-                        if is_auth_disabled(router_config, name)
-                        else [Depends(get_authorized_user)]
+            spec = app.openapi()
+            signature = compute_spec_signature(spec)
+        except Exception as ex:
+            # TODO: Publish other error type
+            await devx.notify_import_error_async("<openapi-spec>", ex)
+
+        if spec is not None and signature is not None:
+            try:
+                await devx.notify_devx_refresh_openapi_spec(
+                    RefreshOpenapiSpecParams(
+                        timestamp=utc_now(),
+                        openapiSignature=signature,
+                        openapiDoc=spec,
+                        importResults=app_state.submodule_import_results,
                     ),
                 )
-        except Exception as e:
-            print(e)
-            continue
+            except Exception as ex:
+                # TODO: Publish other error type
+                await devx.notify_import_error_async("<openapi-publish>", ex)
 
-    print(routes.routes)
+    # Set flag for health endpoint to start returning OK
+    app_state.started_event.set()
 
-    return routes
-
-
-def get_firebase_config() -> dict | None:
-    extensions = os.environ.get("DATABUTTON_EXTENSIONS", "[]")
-    extensions = json.loads(extensions)
-
-    for ext in extensions:
-        if ext["name"] == "firebase-auth":
-            return ext["config"]["firebaseConfig"]
-
-    return None
-
-
-def get_stack_auth_config() -> dict | None:
-    extensions = os.environ.get("DATABUTTON_EXTENSIONS", "[]")
-    extensions = json.loads(extensions)
-
-    for ext in extensions:
-        if ext["name"] == "stack-auth":
-            return ext["config"]
-
-    return None
-
-
-def parse_auth_configs() -> list[AuthConfig]:
-    """Parse auth configs from both firebase-auth and stack-auth extensions."""
-    auth_configs: list[AuthConfig] = []
-
-    # Add stack-auth config if extension is enabled
-    stack_auth_cfg = get_stack_auth_config()
-    if stack_auth_cfg:
-        project_id = stack_auth_cfg["projectId"]
-        auth_configs.append(
-            AuthConfig(
-                issuer=f"https://api.stack-auth.com/api/v1/projects/{project_id}",
-                jwks_url=stack_auth_cfg["jwksUrl"],
-                audience=project_id,
-            )
+    # Publish that we're up and running again
+    if enable_publishing:
+        await devx.notify_devx_async(
+            Topics.backend_ready,
+            BackendReady(
+                timestamp=utc_now(),
+                openapiSignature=signature,
+                startupTime=time.monotonic() - app_state.app_created_time,
+                importResults=app_state.submodule_import_results,
+                ok=all(m.ok for m in app_state.submodule_import_results),
+            ),
         )
 
-    # Add firebase auth config if extension is enabled
-    firebase_cfg = get_firebase_config()
-    if firebase_cfg:
-        project_id = firebase_cfg["projectId"]
-        auth_configs.append(
-            AuthConfig(
-                issuer=f"https://securetoken.google.com/{project_id}",
-                jwks_url="https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com",
-                audience=project_id,
-            )
+    # Yield for the active lifespan of the app
+    yield
+
+    # App is shutting down
+    if enable_publishing:
+        await devx.notify_devx_async(
+            Topics.backend_shutdown,
+            BackendShutdown(
+                timestamp=utc_now(),
+                openapiSignature=signature,
+            ),
         )
 
-    return auth_configs
+
+def add_middleware(app: FastAPI):
+    """Adds middleware to the app."""
+
+    #
+    # NB! Middleware added with app.add_middleware runs in the opposite order!
+    # E.g. the request-id middleware is at the end here so the request id is
+    # available in the other middlewares.
+    #
+
+    app_state = get_app_state(app)
+    cfg = app_state.cfg
+    devx = app_state.devx
+
+    # Publish request checkpoint messages to workspace if enabled
+    if cfg.ENABLE_WORKSPACE_PUBLISH:
+
+        def e2m(ex: BaseException) -> ExceptionModel:
+            return convert_exception_to_model(cfg, ex)
+
+        app.add_middleware(
+            WorkspacePublishMiddleware,
+            exception_to_model=e2m,
+            publish=devx.notify_devx_async,
+        )
+
+    # Kill cookies (can perhaps open up when all apps are on subdomains, although if we
+    # want to open up cookies on databutton.com, we need to enforce path restriction)
+    app.add_middleware(
+        CookieKillerMiddleware,
+    )
+
+    # Skip some extra validation when working in a local environment
+    # Disabled, don't think this is very useful
+    # if cfg.ENVIRONMENT != "development":
+    #     app.add_middleware(
+    #         DevxValidationMiddleware,
+    #         project_id=cfg.DATABUTTON_PROJECT_ID,
+    #         service_type=cfg.DATABUTTON_SERVICE_TYPE,
+    #     )
+
+    # Note: CORS is configured in external proxy
+
+    # Extract or make up a request id
+    app.add_middleware(
+        RequestIdMiddleware,
+    )
 
 
-def create_app() -> FastAPI:
-    """Create the app. This is called by uvicorn with the factory option to construct the app object."""
-    app = FastAPI()
-    app.include_router(import_api_routers())
+def custom_generate_unique_id(route: APIRoute | APIWebSocketRoute):
+    """We use a custom openapi route id generation.
 
-    for route in app.routes:
-        if hasattr(route, "methods"):
-            for method in route.methods:
-                print(f"{method} {route.path}")
+    Here we produce ids that can be used as unique method names
+    in the generated brain client in typescript.
+    """
 
-    auth_configs = parse_auth_configs()
+    # Example route properties:
+    # route.name: name_of_handler_function
+    # route.path_format: /routes/unrelated/path/name/{param}
+    # route.endpoint: <function name_of_handler_function>
+    # route.tags: []
+    # route.methods: {'GET'}
 
-    if len(auth_configs) == 0:
-        print("No auth extensions found")
-        app.state.auth_configs = None
-    else:
-        print(f"Found {len(auth_configs)} auth config(s)")
-        app.state.auth_configs = auth_configs
+    # Just use the name of the python handler function!
+    # Assuming:
+    # - nobody uses both @router.get and @router.post on the same handler.
+    # - nobody uses the same python function name for handlers in different files
+    return re.sub(r"\W", "_", route.name)
+
+
+def create_app(cfg: Config | None = None) -> FastAPI:
+    """Factory function to create app object.
+
+    This is called by e.g. uvicorn to construct the app object.
+    """
+    cfg = checked_config(cfg)
+    app_state = init_app_state(cfg)
+    devx = app_state.devx
+
+    app = FastAPI(
+        title="Databutton generated API",
+        version="0.0.1",
+        servers=[
+            {
+                "url": f"http://127.0.0.1:{cfg.USER_API_PORT}",
+                "description": "Internal",
+            },
+            {
+                "url": f"{cfg.DEVX_HOST}{cfg.DEVX_BASE_PATH}/app",
+                "description": "External",
+            },
+        ],
+        generate_unique_id_function=custom_generate_unique_id,
+        lifespan=lifespan,
+    )
+
+    # Attach app-wide state without using global variables, this is what
+    # will make testing with different app configurations possible
+    set_app_state(app, app_state)
+
+    # Process exceptions more?
+    # def exception_handler(request: Request, exc: Exception) -> Response:
+    # app.add_exception_handler(Exception, exception_handler)
+    # app.add_exception_handler(422, exception_handler)
+
+    # Add middleware applying to all routers
+    add_middleware(app)
+
+    # Internal health check endpoint.
+    # Called by infrastructure on container startup.
+    # Included in api spec to ensure brain client is always generated.
+    # Can also be used by users webapp to ping user's backend for faster perceived startup in prod.
+    app.get("/_healthz")(check_health)
+
+    # Build dependencies to inject in routers
+    auth_dependencies: list[params.Depends] = (
+        [Depends(get_authorized_user)] if app_state.auth_configs else []
+    )
+
+    if cfg.ENABLE_WORKSPACE_PUBLISH and cfg.DEVX_URL_INTERNAL:
+        # Wait for devx server to have written initial code files
+        # to disk before we try to import user endpoint modules.
+        # NB! This is deliberately NOT the regular devx health endpoint,
+        # because that one waits for this app to be ready!
+        if not devx.wait_for_devx_ready():
+            raise RuntimeError("Devx server not ready.")
+
+        # Configure log forwarding here so prints during imports are included
+        configure_log_forwarding(devx)
+
+    # Import user code to define routes
+    try:
+        user_endpoints_router, import_results = make_user_endpoints_router(
+            cfg,
+            devx,
+            auth_dependencies=auth_dependencies,
+            enable_auth=len(app_state.auth_configs) > 0,
+        )
+        app.include_router(user_endpoints_router)
+        app_state = get_app_state(app)
+        app_state.submodule_import_results = import_results
+
+    except Exception as ex:
+        if cfg.ENABLE_WORKSPACE_PUBLISH:
+            devx.notify_import_error_sync("<router>", ex)
 
     return app
-
-
-app = create_app()
