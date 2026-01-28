@@ -1,0 +1,1 @@
+{"routers":{"users":{"name":"users","version":"2026-01-26T13:51:06.840000Z","disableAuth":true},"shifts":{"name":"shifts","version":"2026-01-26T13:24:24.343000Z","disableAuth":true},"swaps":{"name":"swaps","version":"2026-01-26T13:36:28.847000Z","disableAuth":true}}}
